@@ -196,7 +196,23 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
     if plugins_file(root).is_some() {
         return None;
     }
-    let vite = vite_config_file(root)?;
+    // Every way this function declines to produce values looks the same from
+    // the outside -- the server starts and serves, with `server.fs.allow`,
+    // `resolve.alias`, `define` and the rest quietly absent. A config that was
+    // named and then not read is a mistake, not a configuration, so say so.
+    let vite = match vite_config_file(root) {
+        Some(v) => v,
+        None => {
+            if let Some(named) = VITE_CONFIG_OVERRIDE.get() {
+                eprintln!(
+                    "oj: --config named {} and it is not a readable file; \
+                     continuing without any of the values it would have carried",
+                    named.display()
+                );
+            }
+            return None;
+        }
+    };
     let store = oj_cache::config_extract::ConfigExtractStore::new(
         root,
         &format!(
@@ -233,7 +249,37 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
     if !stderr.is_empty() {
         eprint!("{stderr}");
     }
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let json: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!(
+                "oj: could not read the vite config extractor's output ({e}); \
+                 exit {}, {} bytes out, {} bytes err, script {} ({} bytes), \
+                 OJ_CACHE_ROOT {}, NODE_COMPILE_CACHE {}; continuing without any \
+                 of the values {} would have carried",
+                out.status,
+                out.stdout.len(),
+                out.stderr.len(),
+                script.display(),
+                std::fs::metadata(&script).map(|m| m.len()).unwrap_or(0),
+                oj_cache::cache_root(root).display(),
+                std::path::Path::new(&crate::node_compile_cache(root)).display(),
+                vite.display()
+            );
+            return None;
+        }
+    };
+    if json.get("__ok").and_then(|v| v.as_bool()) != Some(true) {
+        // The extractor writes "{}" and its reason to stderr when the config
+        // throws. Anything else here is the extractor itself having gone wrong,
+        // and either way every value is about to be silently missing.
+        eprintln!(
+            "oj: extracting {} produced no values (exit {}); server.fs.allow, \
+             resolve.alias, define and the rest of that config are not in effect",
+            vite.display(),
+            out.status,
+        );
+    }
     if json.get("__ok").and_then(|v| v.as_bool()) == Some(true) {
         let deps: Vec<PathBuf> = json
             .get("__deps")
